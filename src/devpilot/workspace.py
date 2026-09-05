@@ -56,6 +56,37 @@ def repository_snapshot(workspace: Path) -> str:
     return "Files:\n" + "\n".join(names) + "\n\nKey files:\n" + "\n\n".join(snippets)
 
 
+SOURCE_SUFFIXES = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb", ".php", ".java", ".cs",
+    ".c", ".h", ".cpp", ".sh", ".json", ".toml", ".yaml", ".yml", ".md", ".txt", ".cfg",
+}
+
+
+def source_context(workspace: Path, issue_text: str, budget: int = 40_000, per_file: int = 12_000) -> str:
+    """Return the current contents of files the coder may be asked to rewrite.
+
+    The coder returns complete file replacements, so without the existing text it silently
+    deletes everything it did not think to write. Files named in the issue come first, so
+    they survive the budget even in a large repository.
+    """
+    names = command(["git", "ls-files"], workspace).splitlines()
+    mentioned = [n for n in names if n in issue_text or Path(n).name in issue_text]
+    sections, used = [], 0
+    for name in mentioned + [n for n in names if n not in mentioned]:
+        path = workspace / name
+        if path.suffix.lower() not in SOURCE_SUFFIXES or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if len(text) > per_file or used + len(text) > budget:
+            continue
+        sections.append(f"--- {name} ---\n{text}")
+        used += len(text)
+    return "\n\n".join(sections) if sections else "(no readable source files)"
+
+
 def apply_changes(workspace: Path, changes: list[dict]) -> list[str]:
     if not 1 <= len(changes) <= 8:
         raise WorkspaceError("DevPilot accepts between 1 and 8 generated file changes per run.")

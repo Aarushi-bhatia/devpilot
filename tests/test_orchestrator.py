@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from devpilot.openrouter import OpenRouterError, json_response
-from devpilot.workspace import apply_changes, changed_files, command, verify
+from devpilot.workspace import apply_changes, changed_files, command, source_context, verify
 
 
 def repository(tmp_path: Path) -> Path:
@@ -56,3 +56,16 @@ def test_json_response_rejects_a_non_json_reply() -> None:
     """The free router sometimes answers with a safety classifier instead of a chat model."""
     with pytest.raises(OpenRouterError):
         json_response("User Safety: safe")
+
+
+def test_source_context_includes_contents_and_prioritises_the_named_file(tmp_path: Path) -> None:
+    """The coder rewrites whole files, so it must receive their current contents."""
+    workspace = repository(tmp_path)
+    (workspace / "src").mkdir()
+    (workspace / "src/utils.js").write_text("function existing() { return 1; }\n")
+    (workspace / "src/other.js").write_text("function other() { return 2; }\n")
+    command(["git", "add", "--all"], workspace)
+    command(["git", "commit", "-m", "sources"], workspace)
+    context = source_context(workspace, "Add a helper to src/utils.js please")
+    assert "function existing()" in context
+    assert context.index("src/utils.js") < context.index("src/other.js")

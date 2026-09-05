@@ -10,7 +10,7 @@ from .openrouter import json_call
 from .store import RunStore
 from .workspace import (
     apply_changes, changed_files, clone, commit_and_push, create_branch, default_branch,
-    repository_snapshot, verify,
+    repository_snapshot, source_context, verify,
 )
 
 EventHandler = Callable[[Event], None]
@@ -50,11 +50,15 @@ Return exactly {{"plan":["step", "step"]}} with 2–5 concrete steps.""")
             raise ValueError("Planner returned an invalid plan.")
         return plan
 
-    def _changes(self, issue: Issue, plan: list[str], snapshot: str, feedback: str = "") -> list[dict]:
+    def _changes(self, issue: Issue, plan: list[str], snapshot: str, sources: str, feedback: str = "") -> list[dict]:
         response = json_call(self.openrouter_key, SYSTEM, f"""Implement this issue in the cloned repository.
 Issue: {issue.title}\n{issue.body}
 Approved plan: {plan}
-Repository information: {snapshot[:24000]}
+Repository information: {snapshot[:8000]}
+
+Current contents of existing files. Each entry you return REPLACES the whole file, so any file
+you touch must be returned complete, preserving every existing line you are not changing:
+{sources[:40000]}
 {('Previous verification failed:\n' + feedback[-5000:]) if feedback else ''}
 Return exactly {{"changes":[{{"path":"relative/path", "content":"complete new file content"}}],"summary":"short"}}.
 Return 1–8 complete file replacements or additions. Do not include a test command.""")
@@ -81,6 +85,7 @@ Return 1–8 complete file replacements or additions. Do not include a test comm
         self._transition(run, RunState.EXPLORING, "Cloning repository into an isolated DevPilot workspace.")
         clone(repository_url, workspace, self.github_token)
         snapshot = repository_snapshot(workspace)
+        sources = source_context(workspace, f"{issue.title}\n{issue.body}")
         self._transition(run, RunState.PLANNING, "Requesting a plan from OpenRouter's free-model router.")
         run.plan = self._plan(issue, snapshot)
         self.store.save(run)
@@ -91,7 +96,7 @@ Return 1–8 complete file replacements or additions. Do not include a test comm
         branch = f"devpilot/issue-{issue_number}-{run.id}"
         create_branch(workspace, branch)
         self._transition(run, RunState.IMPLEMENTING, "Generating and applying confined file changes.")
-        changes = self._changes(issue, run.plan, snapshot)
+        changes = self._changes(issue, run.plan, snapshot, sources)
         files = apply_changes(workspace, changes)
         self._transition(run, RunState.IMPLEMENTING, f"Changed: {', '.join(files)}")
         verification = ""
@@ -106,7 +111,7 @@ Return 1–8 complete file replacements or additions. Do not include a test comm
                     self._transition(run, RunState.FAILED, f"Verification failed after one debug attempt: {verification[-500:]}")
                     return run
                 self._transition(run, RunState.IMPLEMENTING, "Verification failed; requesting one constrained debugging pass.")
-                files = apply_changes(workspace, self._changes(issue, run.plan, snapshot, verification))
+                files = apply_changes(workspace, self._changes(issue, run.plan, snapshot, sources, verification))
                 self._transition(run, RunState.IMPLEMENTING, f"Debug pass changed: {', '.join(files)}")
         self._transition(run, RunState.REVIEWING, f"Reviewing diff and verification result. {changed_files(workspace)}")
         base = default_branch(workspace)
