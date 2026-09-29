@@ -48,5 +48,6 @@ class RunStore:
         events = [Event(state=RunState(item["state"]), message=item["message"], at=item["at"]) for item in raw["events"]]
         return Run(
             id=raw["id"], repository_url=raw["repository_url"], issue_number=raw["issue_number"],
-            state=RunState(raw["state"]), plan=raw["plan"], events=events, created_at=raw["created_at"],
+            state=RunState(raw["state"]), plan=raw["plan"], review=raw.get("review", {}),
+            events=events, created_at=raw["created_at"],
         )

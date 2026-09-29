@@ -64,6 +64,11 @@ Because the blast radius is contained, dependencies can be installed, which is w
 real test signal possible. Without a container runtime DevPilot falls back to host tooling,
 which installs nothing and therefore usually reports verification as skipped.
 
+**The diff is reviewed before the pull request opens.** The model is shown its own diff and
+asked whether it addresses the issue and whether it removes anything. The verdict and findings
+go into the pull request body ahead of the test output, so a human sees them first. It never
+blocks: a change that passed its tests still ships as a draft, with the concerns attached.
+
 **Failures are recorded, not raised.** Any exception is caught and persisted as a `failed`
 state with its reason, so a run that dies still leaves a readable history.
 
@@ -71,8 +76,9 @@ state with its reason, so a run that dies still leaves a readable history.
 
 These are known and deliberate, not oversights:
 
-- **The review step does not review.** It reports which files changed; it does not inspect the
-  diff. This is the next planned feature.
+- **The review is written by the author.** The model that wrote the change also reviews it, so
+  it shares the blind spots that produced the change. It is a prompt to look, not assurance,
+  and it never blocks the pull request.
 - **Without Docker there is no isolation.** The fallback path runs host tooling as the current
   user with the full environment, and installs nothing, so verification is usually skipped.
   Install Docker to get both isolation and real test results.
@@ -84,9 +90,9 @@ These are known and deliberate, not oversights:
 
 ## Roadmap
 
-1. A real review pass over the diff before the pull request is opened.
-2. A `devpilot clean` command for old workspaces.
-3. Re-planning with feedback instead of ending the run on rejection.
+1. A `devpilot clean` command for old workspaces.
+2. Re-planning with feedback instead of ending the run on rejection.
+3. Review by a second, different model, so the reviewer does not share the author's blind spots.
 4. An offline sandbox mode that pre-fetches dependencies, so the suite runs with no network.
 
 ## Development

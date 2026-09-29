@@ -35,6 +35,7 @@ class Run:
     id: str = field(default_factory=lambda: uuid4().hex[:12])
     state: RunState = RunState.CREATED
     plan: list[str] = field(default_factory=list)
+    review: dict = field(default_factory=dict)
     events: list[Event] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 

@@ -4,7 +4,8 @@ import pytest
 
 from devpilot import sandbox
 from devpilot.openrouter import OpenRouterError, json_response
-from devpilot.workspace import apply_changes, changed_files, command, source_context, verify
+from devpilot.orchestrator import LiveOrchestrator
+from devpilot.workspace import apply_changes, changed_files, command, diff, source_context, verify
 
 
 def repository(tmp_path: Path) -> Path:
@@ -116,3 +117,20 @@ def test_sandbox_finds_docker_desktop_when_it_is_not_on_path(monkeypatch: pytest
     monkeypatch.setattr(sandbox, "FALLBACK_BINARIES", (Path(__file__),))
     assert sandbox.executable() == str(Path(__file__))
     assert sandbox.installed()
+
+
+def test_diff_includes_files_that_are_not_yet_tracked(tmp_path: Path) -> None:
+    """Most of what DevPilot writes is new, and plain git diff would show none of it."""
+    workspace = repository(tmp_path)
+    apply_changes(workspace, [{"path": "LICENSE", "content": "MIT License\n"}])
+    patch = diff(workspace, ["LICENSE"])
+    assert "LICENSE" in patch and "+MIT License" in patch
+
+
+def test_review_body_marks_a_self_review_as_unreliable() -> None:
+    """The reviewer is the author, so the pull request must say so."""
+    body = LiveOrchestrator._review_body(
+        {"verdict": "concerns", "summary": "Removes an export.", "findings": ["isPalindrome dropped"]}
+    )
+    assert "Concerns raised" in body and "isPalindrome dropped" in body
+    assert "same model that wrote the change" in body

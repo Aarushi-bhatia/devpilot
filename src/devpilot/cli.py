@@ -83,6 +83,11 @@ def show(run_id: str) -> None:
     if workflow_run is None:
         raise typer.BadParameter(f"No saved run named {run_id!r}.")
     console.print(Panel(f"{workflow_run.repository_url}\nIssue #{workflow_run.issue_number}", title=f"Run {workflow_run.id}"))
+    if workflow_run.review:
+        colour = {"approve": "green", "concerns": "yellow"}.get(workflow_run.review.get("verdict"), "dim")
+        findings = "\n".join(f"· {item}" for item in workflow_run.review.get("findings", []))
+        console.print(Panel(f"{workflow_run.review.get('summary', '')}\n{findings}".strip(),
+                            title=f"Review — {workflow_run.review.get('verdict')}", border_style=colour))
     for event in workflow_run.events:
         console.print(f"[cyan]{event.at}[/] [bold]{event.state.value}[/] — {event.message}")
 

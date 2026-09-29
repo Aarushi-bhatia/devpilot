@@ -111,6 +111,12 @@ def create_branch(workspace: Path, branch: str) -> None:
     command(["git", "checkout", "-b", branch], workspace)
 
 
+def diff(workspace: Path, paths: list[str], limit: int = 30_000) -> str:
+    """Return the unified diff of the generated paths, including files not yet tracked."""
+    command(["git", "add", "--intent-to-add", "--"] + paths, workspace)
+    return command(["git", "diff", "--"] + paths, workspace)[:limit]
+
+
 def changed_files(workspace: Path, paths: list[str] | None = None) -> str:
     """Report modified and newly added files; plain diff --stat omits untracked additions.
 

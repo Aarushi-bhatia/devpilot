@@ -9,7 +9,7 @@ from .models import Event, Run, RunState
 from .openrouter import json_call
 from .store import RunStore
 from .workspace import (
-    apply_changes, changed_files, clone, commit_and_push, create_branch, default_branch,
+    apply_changes, changed_files, clone, commit_and_push, create_branch, default_branch, diff,
     repository_snapshot, source_context, verify,
 )
 
@@ -67,6 +67,37 @@ Return 1–8 complete file replacements or additions. Do not include a test comm
             raise ValueError("Coder returned no changes.")
         return changes
 
+    def _review(self, issue: Issue, patch: str, verification: str) -> dict:
+        """Ask the model to review its own diff before the pull request is opened.
+
+        A self-review catches the failure the test suite cannot: a change that passes because
+        it does something other than what the issue asked for. The verdict never blocks the
+        pull request — it is written into the body so the human reviewer sees it first.
+        """
+        response = json_call(self.openrouter_key, SYSTEM, f"""Review this diff as a critical reviewer.
+Issue: {issue.title}\n{issue.body}
+Verification result: {verification[-2000:]}
+Diff:
+{patch}
+Judge only what the diff shows. Does it address the issue, and does it break or delete anything?
+Return exactly {{"verdict":"approve"|"concerns","summary":"one sentence","findings":["finding"]}}.
+Use "concerns" if anything is removed, incomplete, or unrelated to the issue. Return at most 5 findings.""")
+        verdict = response.get("verdict")
+        findings = response.get("findings")
+        return {
+            "verdict": verdict if verdict in {"approve", "concerns"} else "unclear",
+            "summary": str(response.get("summary", "")).strip(),
+            "findings": [str(item) for item in findings][:5] if isinstance(findings, list) else [],
+        }
+
+    @staticmethod
+    def _review_body(review: dict) -> str:
+        heading = {"approve": "No concerns raised", "concerns": "Concerns raised"}.get(review["verdict"], "Inconclusive")
+        lines = [f"**Automated review — {heading}.** {review['summary']}".rstrip()]
+        lines += [f"- {finding}" for finding in review["findings"]]
+        lines.append("\nThis review was written by the same model that wrote the change; treat it as a prompt to look, not as assurance.")
+        return "\n".join(lines)
+
     def run(self, repository_url: str, issue_number: int, approve: ApprovalHandler) -> Run:
         """Execute one run, recording any failure as a persisted state rather than a traceback."""
         run = Run(repository_url=repository_url, issue_number=issue_number)
@@ -117,10 +148,22 @@ Return 1–8 complete file replacements or additions. Do not include a test comm
                 authored.update(dict.fromkeys(retried))
                 self._transition(run, RunState.IMPLEMENTING, f"Debug pass changed: {', '.join(retried)}")
         paths = list(authored)
-        self._transition(run, RunState.REVIEWING, f"Reviewing diff and verification result. {changed_files(workspace, paths)}")
+        self._transition(run, RunState.REVIEWING, f"Reviewing the diff. {changed_files(workspace, paths)}")
+        try:
+            review = self._review(issue, diff(workspace, paths), verification)
+        except Exception as error:
+            # A review that cannot be produced must not discard a change that already passed
+            # its tests; the pull request opens with the failure recorded in its place.
+            review = {"verdict": "unclear", "summary": f"The review could not be produced: {error}", "findings": []}
+        run.review = review
+        self.store.save(run)
+        self._transition(run, RunState.REVIEWING, f"Review verdict: {review['verdict']}. {review['summary']}")
+        for finding in review["findings"]:
+            self._transition(run, RunState.REVIEWING, f"  · {finding}")
         base = default_branch(workspace)
         self._transition(run, RunState.CREATING_DRAFT_PR, "Committing, pushing, and creating a GitHub draft PR.")
         commit_and_push(workspace, branch, f"feat: address issue #{issue_number}", self.github_token, paths)
-        pr_url = self.github.create_draft_pr(owner, repository, f"Draft: {issue.title}", f"Closes #{issue_number}\n\nDevPilot verification:\n{verification[-2000:]}", branch, base)
+        body = f"Closes #{issue_number}\n\n{self._review_body(review)}\n\nDevPilot verification:\n{verification[-2000:]}"
+        pr_url = self.github.create_draft_pr(owner, repository, f"Draft: {issue.title}", body, branch, base)
         self._transition(run, RunState.COMPLETED, f"Draft PR created: {pr_url}")
         return run
