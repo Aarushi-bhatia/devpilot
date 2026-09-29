@@ -14,7 +14,9 @@ from .workspace import (
 )
 
 EventHandler = Callable[[Event], None]
-ApprovalHandler = Callable[[Run], bool]
+# True approves; a string rejects with a reason and asks for another plan; False ends the run.
+ApprovalHandler = Callable[[Run], "bool | str"]
+MAX_REPLANS = 3
 
 SYSTEM = """You are DevPilot, a careful software engineer. Return only valid JSON matching the requested shape.
 Do not use Markdown. Make focused, minimal changes. Never include secrets. """
@@ -38,12 +40,17 @@ class LiveOrchestrator:
             raise ValueError("Expected https://github.com/owner/repository")
         return match.group(1), match.group(2)
 
-    def _plan(self, issue: Issue, snapshot: str) -> list[str]:
+    def _plan(self, issue: Issue, snapshot: str, rejected: list[tuple[list[str], str]] | None = None) -> list[str]:
+        history = "".join(
+            f"\nYou previously proposed: {plan}\nThe user rejected it because: {reason or 'no reason given'}"
+            for plan, reason in (rejected or [])
+        )
         response = json_call(self.openrouter_key, SYSTEM, f"""Create an implementation plan for this GitHub issue.
 Issue title: {issue.title}
 Issue body: {issue.body}
 Repository information:
-{snapshot[:24000]}
+{snapshot[:24000]}{history}
+{'Propose a genuinely different approach that addresses the rejection.' if history else ''}
 Return exactly {{"plan":["step", "step"]}} with 2–5 concrete steps.""")
         plan = response.get("plan")
         if not isinstance(plan, list) or not 2 <= len(plan) <= 5 or not all(isinstance(item, str) for item in plan):
@@ -117,13 +124,22 @@ Use "concerns" if anything is removed, incomplete, or unrelated to the issue. Re
         clone(repository_url, workspace, self.github_token)
         snapshot = repository_snapshot(workspace)
         sources = source_context(workspace, f"{issue.title}\n{issue.body}")
-        self._transition(run, RunState.PLANNING, "Requesting a plan from OpenRouter's free-model router.")
-        run.plan = self._plan(issue, snapshot)
-        self.store.save(run)
-        self._transition(run, RunState.AWAITING_APPROVAL, "Plan ready. No files have been changed.")
-        if not approve(run):
-            self._transition(run, RunState.REJECTED, "Plan rejected by user. The isolated clone was left untouched.")
-            return run
+        rejected: list[tuple[list[str], str]] = []
+        while True:
+            self._transition(run, RunState.PLANNING, "Requesting a plan from OpenRouter's free-model router.")
+            run.plan = self._plan(issue, snapshot, rejected)
+            self.store.save(run)
+            self._transition(run, RunState.AWAITING_APPROVAL, "Plan ready. No files have been changed.")
+            decision = approve(run)
+            if decision is True:
+                break
+            # A handler may return a rejection reason instead of False, asking for another plan.
+            # Nothing has been written yet, so re-planning costs one model call and no cleanup.
+            if not isinstance(decision, str) or len(rejected) >= MAX_REPLANS:
+                self._transition(run, RunState.REJECTED, "Plan rejected by user. The isolated clone was left untouched.")
+                return run
+            rejected.append((run.plan, decision))
+            self._transition(run, RunState.PLANNING, f"Re-planning ({len(rejected)}/{MAX_REPLANS}): {decision}")
         branch = f"devpilot/issue-{issue_number}-{run.id}"
         create_branch(workspace, branch)
         self._transition(run, RunState.IMPLEMENTING, "Generating and applying confined file changes.")

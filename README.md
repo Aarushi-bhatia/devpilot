@@ -1,5 +1,7 @@
 # DevPilot
 
+[![tests](https://github.com/Aarushi-bhatia/devpilot/actions/workflows/tests.yml/badge.svg)](https://github.com/Aarushi-bhatia/devpilot/actions/workflows/tests.yml)
+
 DevPilot is a terminal-first, transparent autonomous GitHub software engineer. It reads a
 GitHub issue, plans a change, implements it in an isolated clone, and opens a draft pull
 request — pausing for explicit human approval before it writes a single file.
@@ -37,11 +39,15 @@ design and the file is created mode `600`.
 devpilot run https://github.com/owner/repository --issue 42
 devpilot history
 devpilot show <run-id>
+devpilot clean
 ```
 
 `run` fetches the issue, clones the repository, and presents a generated plan. Nothing is
-written until you approve it; declining leaves the clone untouched and records the run as
-rejected.
+written until you approve it. At the prompt, `y` approves, `r` asks for a different plan with
+a reason you supply, and anything else ends the run with the clone untouched.
+
+`clean` removes cloned workspaces, which grow once verification installs dependencies. Run
+history is kept; the two most recent workspaces are retained unless `--keep` says otherwise.
 
 ## Design
 
@@ -70,7 +76,9 @@ go into the pull request body ahead of the test output, so a human sees them fir
 blocks: a change that passed its tests still ships as a draft, with the concerns attached.
 
 **Failures are recorded, not raised.** Any exception is caught and persisted as a `failed`
-state with its reason, so a run that dies still leaves a readable history.
+state with its reason, so a run that dies still leaves a readable history. Model calls carry a
+wall-clock deadline as well as a socket timeout, because the free router can trickle bytes
+indefinitely without ever tripping a socket read timeout.
 
 ## Limitations
 
@@ -90,10 +98,9 @@ These are known and deliberate, not oversights:
 
 ## Roadmap
 
-1. A `devpilot clean` command for old workspaces.
-2. Re-planning with feedback instead of ending the run on rejection.
-3. Review by a second, different model, so the reviewer does not share the author's blind spots.
-4. An offline sandbox mode that pre-fetches dependencies, so the suite runs with no network.
+1. Review by a second, different model, so the reviewer does not share the author's blind spots.
+2. An offline sandbox mode that pre-fetches dependencies, so the suite runs with no network.
+3. A web view over the persisted run timeline.
 
 ## Development
 

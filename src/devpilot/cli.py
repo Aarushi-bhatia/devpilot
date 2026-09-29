@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import re
+import shutil
 
 import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .config import database_path, initialize, load_secrets, workspaces_dir
+from .config import database_path, initialize, load_secrets, reclaimable, workspaces_dir
 from .models import Event, Run
 from .orchestrator import LiveOrchestrator
 from .store import RunStore
@@ -44,12 +45,17 @@ def run(
     if not GITHUB_REPOSITORY.fullmatch(repository_url):
         raise typer.BadParameter("Provide a GitHub repository URL: https://github.com/owner/repository")
 
-    def approve(workflow_run: Run) -> bool:
+    def approve(workflow_run: Run) -> bool | str:
         console.print("\n[bold]Implementation plan[/]")
         for number, step in enumerate(workflow_run.plan, 1):
             console.print(f"  {number}. {step}")
-        console.print("\n[dim]Approval is required before implementation.[/]")
-        return typer.confirm("Approve this plan?", default=False)
+        console.print("\n[dim]Nothing has been written yet. [y] approve  [r] re-plan  [N] reject[/]")
+        answer = typer.prompt("Approve this plan? [y/r/N]", default="N", show_default=False).strip().lower()
+        if answer.startswith("y"):
+            return True
+        if answer.startswith("r"):
+            return typer.prompt("What should change?").strip() or "The approach was rejected without detail."
+        return False
 
     secrets = load_secrets()
     workflow_run = LiveOrchestrator(
@@ -90,6 +96,29 @@ def show(run_id: str) -> None:
                             title=f"Review — {workflow_run.review.get('verdict')}", border_style=colour))
     for event in workflow_run.events:
         console.print(f"[cyan]{event.at}[/] [bold]{event.state.value}[/] — {event.message}")
+
+
+@app.command()
+def clean(
+    keep: int = typer.Option(2, min=0, help="Keep this many of the most recent runs' workspaces."),
+    force: bool = typer.Option(False, "--force", help="Delete without confirming."),
+) -> None:
+    """Delete cloned workspaces, which grow once verification installs dependencies."""
+    recent = {item.id for item in store().recent(keep)} if keep else set()
+    targets = reclaimable(recent)
+    if not targets:
+        console.print("Nothing to clean.")
+        return
+    total = sum(size for _, size in targets)
+    for path, size in targets:
+        console.print(f"  {path.name}  [dim]{size / 1_000_000:.1f} MB[/]")
+    console.print(f"\n{len(targets)} workspace(s), [bold]{total / 1_000_000:.1f} MB[/]. Run history is kept.")
+    if not force and not typer.confirm("Delete these?", default=False):
+        console.print("Left unchanged.")
+        return
+    for path, _ in targets:
+        shutil.rmtree(path, ignore_errors=True)
+    console.print(f"[green]Reclaimed {total / 1_000_000:.1f} MB.[/]")
 
 
 if __name__ == "__main__":

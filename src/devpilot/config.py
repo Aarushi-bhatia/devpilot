@@ -51,6 +51,20 @@ def load_secrets() -> dict[str, str]:
     return {**values, **{key: value for key, value in os.environ.items() if value}}
 
 
+def reclaimable(keep: set[str]) -> list[tuple[Path, int]]:
+    """Return cloned workspaces eligible for deletion, with their size in bytes.
+
+    Verification installs the target repository's dependencies into the clone, so these grow
+    far faster than the shallow clone alone suggests.
+    """
+    found = []
+    for path in sorted(workspaces_dir().iterdir()):
+        if path.is_dir() and path.name not in keep:
+            size = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+            found.append((path, size))
+    return found
+
+
 def workspaces_dir() -> Path:
     path = home_dir() / "workspaces"
     path.mkdir(parents=True, exist_ok=True)
