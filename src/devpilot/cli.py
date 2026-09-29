@@ -28,9 +28,9 @@ def display_event(event: Event) -> None:
 
 @app.command()
 def init() -> None:
-    """Create DevPilot's user configuration directory."""
+    """Create DevPilot's user directory and a private .env template."""
     directory, created = initialize()
-    message = "Created default configuration." if created else "Configuration already exists; left unchanged."
+    message = "Created. Add your GITHUB_TOKEN and OPENROUTER_API_KEY to .env." if created else "Already exists; left unchanged."
     console.print(Panel(f"[bold]{directory}[/]\n{message}", title="DevPilot initialized", border_style="green"))
 
 

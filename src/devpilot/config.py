@@ -4,18 +4,6 @@ import os
 from pathlib import Path
 
 
-DEFAULT_CONFIG = """# DevPilot user configuration
-# Credentials belong in ~/.dev-pilot/.env, never in a repository.
-# This is deliberately fixed to OpenRouter's zero-cost router.
-model = "openrouter/free"
-max_debug_attempts = 1
-
-[execution]
-# Test commands are discovered from common project files and run inside a clone.
-enabled = true
-timeout_seconds = 120
-"""
-
 ENV_TEMPLATE = """# Required for live DevPilot runs. Keep this file private.
 GITHUB_TOKEN=
 OPENROUTER_API_KEY=
@@ -27,10 +15,6 @@ def home_dir() -> Path:
     return Path(os.environ.get("DEV_PILOT_HOME", Path.home() / ".dev-pilot")).expanduser()
 
 
-def config_path() -> Path:
-    return home_dir() / "config.toml"
-
-
 def database_path() -> Path:
     return home_dir() / "runs.sqlite3"
 
@@ -40,13 +24,15 @@ def env_path() -> Path:
 
 
 def initialize() -> tuple[Path, bool]:
-    """Create the DevPilot home and default config, without overwriting user data."""
+    """Create the DevPilot home and a private secrets template, without overwriting user data.
+
+    There is deliberately no settings file: the model is pinned to a zero-cost router and the
+    debug budget is fixed, so exposing them as configuration would only invite breaking those
+    guarantees. Secrets are the one thing a user must supply, and they live in .env alone.
+    """
     directory = home_dir()
+    created = not directory.exists()
     directory.mkdir(parents=True, exist_ok=True)
-    path = config_path()
-    created = not path.exists()
-    if created:
-        path.write_text(DEFAULT_CONFIG, encoding="utf-8")
     secrets = env_path()
     if not secrets.exists():
         secrets.write_text(ENV_TEMPLATE, encoding="utf-8")

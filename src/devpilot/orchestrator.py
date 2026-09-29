@@ -97,8 +97,10 @@ Return 1–8 complete file replacements or additions. Do not include a test comm
         create_branch(workspace, branch)
         self._transition(run, RunState.IMPLEMENTING, "Generating and applying confined file changes.")
         changes = self._changes(issue, run.plan, snapshot, sources)
-        files = apply_changes(workspace, changes)
-        self._transition(run, RunState.IMPLEMENTING, f"Changed: {', '.join(files)}")
+        # Accumulated across the debug pass: verification installs dependencies into the clone,
+        # so only paths DevPilot authored may be staged, and a debug pass must not drop the first.
+        authored = dict.fromkeys(apply_changes(workspace, changes))
+        self._transition(run, RunState.IMPLEMENTING, f"Changed: {', '.join(authored)}")
         verification = ""
         for attempt in range(2):
             self._transition(run, RunState.VERIFYING, "Running locally discovered verification commands.")
@@ -111,12 +113,14 @@ Return 1–8 complete file replacements or additions. Do not include a test comm
                     self._transition(run, RunState.FAILED, f"Verification failed after one debug attempt: {verification[-500:]}")
                     return run
                 self._transition(run, RunState.IMPLEMENTING, "Verification failed; requesting one constrained debugging pass.")
-                files = apply_changes(workspace, self._changes(issue, run.plan, snapshot, sources, verification))
-                self._transition(run, RunState.IMPLEMENTING, f"Debug pass changed: {', '.join(files)}")
-        self._transition(run, RunState.REVIEWING, f"Reviewing diff and verification result. {changed_files(workspace)}")
+                retried = apply_changes(workspace, self._changes(issue, run.plan, snapshot, sources, verification))
+                authored.update(dict.fromkeys(retried))
+                self._transition(run, RunState.IMPLEMENTING, f"Debug pass changed: {', '.join(retried)}")
+        paths = list(authored)
+        self._transition(run, RunState.REVIEWING, f"Reviewing diff and verification result. {changed_files(workspace, paths)}")
         base = default_branch(workspace)
         self._transition(run, RunState.CREATING_DRAFT_PR, "Committing, pushing, and creating a GitHub draft PR.")
-        commit_and_push(workspace, branch, f"feat: address issue #{issue_number}", self.github_token)
+        commit_and_push(workspace, branch, f"feat: address issue #{issue_number}", self.github_token, paths)
         pr_url = self.github.create_draft_pr(owner, repository, f"Draft: {issue.title}", f"Closes #{issue_number}\n\nDevPilot verification:\n{verification[-2000:]}", branch, base)
         self._transition(run, RunState.COMPLETED, f"Draft PR created: {pr_url}")
         return run

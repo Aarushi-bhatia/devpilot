@@ -5,6 +5,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from . import sandbox
+
 
 class WorkspaceError(RuntimeError):
     pass
@@ -109,9 +111,13 @@ def create_branch(workspace: Path, branch: str) -> None:
     command(["git", "checkout", "-b", branch], workspace)
 
 
-def changed_files(workspace: Path) -> str:
-    """Report modified and newly added files; plain diff --stat omits untracked additions."""
-    return command(["git", "status", "--short"], workspace) or "No changes"
+def changed_files(workspace: Path, paths: list[str] | None = None) -> str:
+    """Report modified and newly added files; plain diff --stat omits untracked additions.
+
+    Scoped to the generated paths when given, so dependencies installed during verification
+    do not drown the review line in noise.
+    """
+    return command(["git", "status", "--short", "--"] + (paths or ["."]), workspace) or "No changes"
 
 
 SKIPPED = "Verification skipped: {}. This draft PR carries no test signal; review the diff manually."
@@ -129,10 +135,22 @@ def usable(arguments: list[str], workspace: Path) -> bool:
 def verify(workspace: Path) -> str:
     """Run only fixed, locally discovered test commands; never model-provided shell text.
 
+    Prefers a container, where dependencies can be installed safely and the suite cannot
+    reach the host. Without a container runtime it falls back to already-installed host
+    tooling, which cannot install anything and so usually skips.
+
     A missing toolchain is an environment gap, not a defect in the generated change, so it
     is reported as a skip instead of a failure that would trigger a pointless debug pass.
     """
     command(["git", "diff", "--check"], workspace)
+    if sandbox.available():
+        try:
+            return sandbox.verify(workspace, os.getuid(), os.getgid())
+        except sandbox.SandboxUnavailable as error:
+            # The change was never executed, so this is a skip, not a failing suite.
+            return SKIPPED.format(f"sandboxed verification did not run — {error}")
+    if sandbox.installed():
+        return SKIPPED.format("Docker is installed but its daemon is not responding")
     if (workspace / "pyproject.toml").exists() or (workspace / "pytest.ini").exists():
         if not usable(["python3", "-m", "pytest", "--version"], workspace):
             return SKIPPED.format("pytest is not installed")
@@ -154,7 +172,14 @@ def verify(workspace: Path) -> str:
     return "No supported test configuration found; whitespace validation passed."
 
 
-def commit_and_push(workspace: Path, branch: str, message: str, github_token: str) -> None:
-    command(["git", "add", "--all"], workspace)
+def commit_and_push(workspace: Path, branch: str, message: str, github_token: str, paths: list[str]) -> None:
+    """Commit only the paths DevPilot generated.
+
+    Verification installs the repository's dependencies into the clone, so `git add --all`
+    would sweep node_modules, __pycache__ and build output into the pull request whenever the
+    target repository does not happen to ignore them. Staging the generated paths explicitly
+    keeps the diff to what was actually authored, whatever the suite left behind.
+    """
+    command(["git", "add", "--"] + paths, workspace)
     command(["git", "commit", "-m", message], workspace)
     command(["git", "push", "-u", "origin", branch], workspace, extra_env=github_auth(github_token))

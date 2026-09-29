@@ -1,33 +1,37 @@
 # DevPilot
 
-DevPilot is a terminal-first, transparent autonomous GitHub software engineer.
-It is designed around an explicit agent state graph:
+DevPilot is a terminal-first, transparent autonomous GitHub software engineer. It reads a
+GitHub issue, plans a change, implements it in an isolated clone, and opens a draft pull
+request — pausing for explicit human approval before it writes a single file.
 
 ```text
 Issue → Understand → Explore → Plan → Approval → Implement → Verify → Review → Draft PR
 ```
 
-DevPilot is live and deliberately **free-only**: it uses GitHub's API with your PAT,
-an isolated clone under `~/.dev-pilot/workspaces/`, and OpenRouter's `openrouter/free`
-router. It makes real changes, runs safe discovered checks, pushes a branch, and opens
-a real draft PR after your approval. Every run is persisted for later inspection.
+Every state transition is persisted to SQLite as it happens, so any past run can be replayed
+with `devpilot show`. The model is pinned to OpenRouter's zero-cost `openrouter/free` router,
+so a run can fail for lack of a free model but will never silently fall back to a paid one.
+
+## Requirements
+
+Python 3.11+, git, and — for isolated verification with real test results — Docker. Without
+Docker, DevPilot still runs but skips most verification.
 
 ## Setup
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e ".[dev]"
 devpilot init
 ```
 
-`devpilot init` creates `~/.dev-pilot/` (or the value of `DEV_PILOT_HOME`) with a
-configuration file, a private `.env` template, and a SQLite run database. Add a GitHub
-PAT with repository/PR access and an OpenRouter API key to `~/.dev-pilot/.env`; never
-store them in a repository. The model is hard-coded to `openrouter/free`, so DevPilot
-will not select a paid model.
+`devpilot init` creates `~/.dev-pilot/` (or `DEV_PILOT_HOME`) containing a private `.env`
+template and a SQLite run database. Add a GitHub PAT with repository and pull-request access
+and an OpenRouter API key to `~/.dev-pilot/.env`. Credentials live outside the repository by
+design and the file is created mode `600`.
 
-## Demo workflow
+## Usage
 
 ```bash
 devpilot run https://github.com/owner/repository --issue 42
@@ -35,13 +39,63 @@ devpilot history
 devpilot show <run-id>
 ```
 
-The `run` command fetches the issue and clones the repository before presenting a
-generated plan. It waits for interactive approval before creating a branch or changing
-any files. A free model can be rate-limited or unavailable; that will stop the run
-without falling back to a paid model.
+`run` fetches the issue, clones the repository, and presents a generated plan. Nothing is
+written until you approve it; declining leaves the clone untouched and records the run as
+rejected.
+
+## Design
+
+**The model's output is data, never instructions.** It returns file contents and nothing else.
+Which test command runs is decided by inspecting the clone — `pyproject.toml` means pytest,
+`package.json` means npm — never by the model. Every generated path is resolved and rejected
+if it escapes the workspace or touches `.git`.
+
+**Approval sits where stopping is still free.** At the gate, only a shallow clone exists. Every
+irreversible action — branch, commit, push, pull request — happens after it. The pull request
+is opened as a draft, so a second human action is required before anything can merge.
+
+**Untrusted code runs in a container.** Verifying generated code means executing the target
+repository's code — its test script, its `conftest.py`, and the `postinstall` hooks of every
+package it depends on. DevPilot runs that inside a disposable container with only the clone
+mounted, no inherited environment, dropped capabilities, and memory and process limits. The
+host filesystem is not mounted, so `~/.dev-pilot/.env` is unreachable even in principle.
+
+Because the blast radius is contained, dependencies can be installed, which is what makes
+real test signal possible. Without a container runtime DevPilot falls back to host tooling,
+which installs nothing and therefore usually reports verification as skipped.
+
+**Failures are recorded, not raised.** Any exception is caught and persisted as a `failed`
+state with its reason, so a run that dies still leaves a readable history.
+
+## Limitations
+
+These are known and deliberate, not oversights:
+
+- **The review step does not review.** It reports which files changed; it does not inspect the
+  diff. This is the next planned feature.
+- **Without Docker there is no isolation.** The fallback path runs host tooling as the current
+  user with the full environment, and installs nothing, so verification is usually skipped.
+  Install Docker to get both isolation and real test results.
+- **The sandbox has network access**, which dependency installation requires. A hostile
+  package cannot reach the host, but it can reach the internet.
+- **Nothing is cleaned up.** Each run leaves a full clone under `~/.dev-pilot/workspaces/`.
+- **Context is size-limited.** The coder receives up to 40 KB of existing source, prioritising
+  files the issue names. Large repositories will exceed this.
 
 ## Roadmap
 
-1. Add a FastAPI dashboard over the persisted run timeline.
-2. Add stronger sandboxing for test execution.
-3. Add language-specific test configuration and test selection.
+1. A real review pass over the diff before the pull request is opened.
+2. A `devpilot clean` command for old workspaces.
+3. Re-planning with feedback instead of ending the run on rejection.
+4. An offline sandbox mode that pre-fetches dependencies, so the suite runs with no network.
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
