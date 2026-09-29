@@ -1,7 +1,5 @@
 # DevPilot
 
-[![tests](https://github.com/Aarushi-bhatia/devpilot/actions/workflows/tests.yml/badge.svg)](https://github.com/Aarushi-bhatia/devpilot/actions/workflows/tests.yml)
-
 DevPilot is a terminal-first, transparent autonomous GitHub software engineer. It reads a
 GitHub issue, plans a change, implements it in an isolated clone, and opens a draft pull
 request — pausing for explicit human approval before it writes a single file.
