@@ -5,7 +5,9 @@ import pytest
 from devpilot import sandbox
 from devpilot.openrouter import OpenRouterError, json_response
 from devpilot.orchestrator import LiveOrchestrator
-from devpilot.workspace import apply_changes, changed_files, command, diff, source_context, verify
+from devpilot.workspace import (
+    apply_changes, changed_files, command, diff, keywords, source_context, verify,
+)
 
 
 def repository(tmp_path: Path) -> Path:
@@ -134,3 +136,32 @@ def test_review_body_marks_a_self_review_as_unreliable() -> None:
     )
     assert "Concerns raised" in body and "isPalindrome dropped" in body
     assert "same model that wrote the change" in body
+
+
+def test_relevance_beats_alphabetical_order_when_the_budget_is_tight(tmp_path: Path) -> None:
+    """A natural issue names no paths, so ranking is what puts the right files in context."""
+    workspace = repository(tmp_path)
+    (workspace / "themes").mkdir()
+    (workspace / "themes/nord.tcss").write_text("$bg-color: #242933;\n")
+    (workspace / "aaa_unrelated.py").write_text("# " + "filler " * 200 + "\n")
+    (workspace / "settings.py").write_text("THEMES = ['nord']\n")
+    command(["git", "add", "--all"], workspace)
+    command(["git", "commit", "-m", "sources"], workspace)
+
+    context = source_context(workspace, "Add a Solarized Dark theme", budget=400)
+    assert "nord.tcss" in context, "a theme file must survive a tight budget"
+    assert "aaa_unrelated.py" not in context, "alphabetical order must not win"
+
+
+def test_an_explicitly_named_file_outranks_everything(tmp_path: Path) -> None:
+    workspace = repository(tmp_path)
+    (workspace / "one.py").write_text("# theme theme theme\n")
+    (workspace / "two.py").write_text("# unrelated\n")
+    command(["git", "add", "--all"], workspace)
+    command(["git", "commit", "-m", "sources"], workspace)
+    context = source_context(workspace, "Fix the bug in two.py, something about theme handling")
+    assert context.index("two.py") < context.index("one.py")
+
+
+def test_common_words_do_not_drive_the_ranking() -> None:
+    assert keywords("Add a new file to the project") == {"project"}

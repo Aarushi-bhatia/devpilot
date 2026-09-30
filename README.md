@@ -78,9 +78,9 @@ state with its reason, so a run that dies still leaves a readable history. Model
 wall-clock deadline as well as a socket timeout, because the free router can trickle bytes
 indefinitely without ever tripping a socket read timeout.
 
-## Limitations
+## Scope and trade-offs
 
-These are known and deliberate, not oversights:
+These are deliberate, not oversights:
 
 - **The review is written by the author.** The model that wrote the change also reviews it, so
   it shares the blind spots that produced the change. It is a prompt to look, not assurance,
@@ -90,9 +90,9 @@ These are known and deliberate, not oversights:
   Install Docker to get both isolation and real test results.
 - **The sandbox has network access**, which dependency installation requires. A hostile
   package cannot reach the host, but it can reach the internet.
-- **Nothing is cleaned up.** Each run leaves a full clone under `~/.dev-pilot/workspaces/`.
-- **Context is size-limited.** The coder receives up to 40 KB of existing source, prioritising
-  files the issue names. Large repositories will exceed this.
+- **Context is size-limited.** The coder receives up to 40 KB of existing source, ordered by
+  relevance to the issue. A repository larger than that will have its least relevant files
+  dropped, so an issue that describes the change vaguely gets a worse selection.
 
 ## Roadmap
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -61,20 +62,50 @@ def repository_snapshot(workspace: Path) -> str:
 SOURCE_SUFFIXES = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb", ".php", ".java", ".cs",
     ".c", ".h", ".cpp", ".sh", ".json", ".toml", ".yaml", ".yml", ".md", ".txt", ".cfg",
+    ".css", ".scss", ".tcss", ".html", ".vue", ".svelte", ".sql", ".kt", ".swift", ".ini",
 }
+
+# Words too common in issue prose to say anything about which files are relevant.
+STOPWORDS = frozenset("""a an and the to of in on for with add adds added new create creates
+should must make it its is are be this that as at by or if not from use using support when
+please file files code change changes update updates existing same like also can will""".split())
+
+
+def keywords(text: str) -> set[str]:
+    """Reduce issue prose to the terms worth matching filenames and contents against."""
+    words = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text.lower())
+    return {word for word in words if word not in STOPWORDS}
+
+
+def relevance(name: str, text: str, terms: set[str], issue_text: str) -> int:
+    """Score a file against the issue. Higher sorts earlier and so survives the budget.
+
+    An issue naming a path is an explicit instruction and outranks everything. Otherwise a
+    term appearing in the path matters far more than the same term in the body, because a
+    file called themes/nord.tcss is about themes while a file merely mentioning the word
+    usually is not.
+    """
+    if name in issue_text or Path(name).name in issue_text:
+        return 1_000
+    lowered = name.lower()
+    score = 10 * sum(1 for term in terms if term in lowered)
+    body = text.lower()
+    return score + sum(1 for term in terms if term in body)
 
 
 def source_context(workspace: Path, issue_text: str, budget: int = 40_000, per_file: int = 12_000) -> str:
     """Return the current contents of files the coder may be asked to rewrite.
 
     The coder returns complete file replacements, so without the existing text it silently
-    deletes everything it did not think to write. Files named in the issue come first, so
-    they survive the budget even in a large repository.
+    deletes everything it did not think to write. In a repository larger than the budget the
+    selection decides whether the coder can see what it is editing, so files are ordered by
+    relevance to the issue rather than by the arbitrary order git lists them in. A well
+    written issue therefore needs no file paths: "add a Solarized Dark theme" surfaces the
+    theme directory and the module that registers themes on its own.
     """
-    names = command(["git", "ls-files"], workspace).splitlines()
-    mentioned = [n for n in names if n in issue_text or Path(n).name in issue_text]
-    sections, used = [], 0
-    for name in mentioned + [n for n in names if n not in mentioned]:
+    terms = keywords(issue_text)
+    candidates = []
+    for name in command(["git", "ls-files"], workspace).splitlines():
         path = workspace / name
         if path.suffix.lower() not in SOURCE_SUFFIXES or not path.is_file():
             continue
@@ -82,7 +113,12 @@ def source_context(workspace: Path, issue_text: str, budget: int = 40_000, per_f
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        if len(text) > per_file or used + len(text) > budget:
+        if len(text) > per_file:
+            continue
+        candidates.append((-relevance(name, text, terms, issue_text), name, text))
+    sections, used = [], 0
+    for _, name, text in sorted(candidates):
+        if used + len(text) > budget:
             continue
         sections.append(f"--- {name} ---\n{text}")
         used += len(text)
