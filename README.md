@@ -1,127 +1,80 @@
 # DevPilot
 
-DevPilot is a terminal-first, transparent autonomous GitHub software engineer. It reads a
-GitHub issue, plans a change, implements it in an isolated clone, and opens a draft pull
-request — pausing for explicit human approval before it writes a single file.
+An autonomous coding agent for GitHub. Give it a repository and an issue: it plans a fix, waits
+for your approval, writes the code, runs the tests in a sandbox, reviews its own diff, and opens
+a draft pull request.
 
 ```text
-Issue → Understand → Explore → Plan → Approval → Implement → Verify → Review → Draft PR
+Issue → Plan → Approve → Implement → Verify → Review → Draft PR
 ```
 
-Every state transition is persisted to SQLite as it happens, so any past run can be replayed
-with `devpilot show`. Every model DevPilot can select is zero-cost, so a run can fail for lack
-of a free model but will never silently fall back to a paid one.
+## Example
 
-## Requirements
+On [gravitype](https://github.com/kanakOS01/gravitype), issue *"Add a Solarized Dark theme"*:
 
-Python 3.11+, git, and — for isolated verification with real test results — Docker. Without
-Docker, DevPilot still runs but skips most verification.
+```text
+            planning  Asking nemotron-3-super-120b-a12b (attempt 1/6) ↳ answered in 67s
+   awaiting_approval  1. gravitype/tui/styles/themes/solarized_dark.tcss: create the theme
+                      2. gravitype/tui/widgets/screens.py: add 'Solarized Dark' to the dropdown
+        implementing  Changed: solarized_dark.tcss, screens.py
+           verifying  Sandboxed tests passed in python:3.12-slim — 381 passed in 42.02s
+           reviewing  Review verdict: approve.
+           completed  Draft PR created: https://github.com/Aarushi-bhatia/gravitype/pull/6
+```
+
+## Features
+
+- **Human approval** before any file is written — approve, reject, or re-plan with feedback
+- **Relevance-ranked context** so the model sees the right files, even in large repositories
+- **Anchored edits** — existing files are changed in place, never regenerated
+- **Sandboxed tests** in Docker, with no access to the host or your credentials
+- **Self-correction** — one debugging pass on failing tests, one revision on review concerns
+- **Resilient model calls** — validated retries across several free models, with deadlines
+- **Full run history** in SQLite, with a live progress display
+
+## Architecture
+
+```text
+cli.py            commands and live progress
+orchestrator.py   the state machine
+├── openrouter.py   model calls and retries
+├── workspace.py    context, edits, verification, commits
+│   └── sandbox.py    Docker test runner
+├── github.py       issues and pull requests
+└── store.py        SQLite run history
+```
+
+## Tech stack
+
+Python · Typer · Rich · SQLite · Docker · OpenRouter · GitHub REST API · pytest · GitHub Actions
 
 ## Setup
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 devpilot init
 ```
 
-`devpilot init` creates `~/.dev-pilot/` (or `DEV_PILOT_HOME`) containing a private `.env`
-template and a SQLite run database. Add a GitHub PAT with repository and pull-request access
-and an OpenRouter API key to `~/.dev-pilot/.env`. Credentials live outside the repository by
-design and the file is created mode `600`.
+Add your keys to `~/.dev-pilot/.env`:
+
+```text
+GITHUB_TOKEN=...
+OPENROUTER_API_KEY=...
+```
 
 ## Usage
 
 ```bash
-devpilot run https://github.com/owner/repository --issue 42
+devpilot run https://github.com/owner/repo --issue 42
 devpilot history
 devpilot show <run-id>
 devpilot clean
 ```
 
-`run` fetches the issue, clones the repository, and presents a generated plan. Nothing is
-written until you approve it. At the prompt, `y` approves, `r` asks for a different plan with
-a reason you supply, and anything else ends the run with the clone untouched.
-
-`clean` removes cloned workspaces, which grow once verification installs dependencies. Run
-history is kept; the two most recent workspaces are retained unless `--keep` says otherwise.
-
-## Design
-
-**The model's output is data, never instructions.** It returns file contents and nothing else.
-Which test command runs is decided by inspecting the clone — `pyproject.toml` means pytest,
-`package.json` means npm — never by the model. Every generated path is resolved and rejected
-if it escapes the workspace or touches `.git`.
-
-**Approval sits where stopping is still free.** At the gate, only a shallow clone exists. Every
-irreversible action — branch, commit, push, pull request — happens after it. The pull request
-is opened as a draft, so a second human action is required before anything can merge.
-
-**Untrusted code runs in a container.** Verifying generated code means executing the target
-repository's code — its test script, its `conftest.py`, and the `postinstall` hooks of every
-package it depends on. DevPilot runs that inside a disposable container with only the clone
-mounted, no inherited environment, dropped capabilities, and memory and process limits. The
-host filesystem is not mounted, so `~/.dev-pilot/.env` is unreachable even in principle.
-
-Because the blast radius is contained, dependencies can be installed, which is what makes
-real test signal possible. Without a container runtime DevPilot falls back to host tooling,
-which installs nothing and therefore usually reports verification as skipped.
-
-**The diff is reviewed before the pull request opens.** The model is shown its own diff and
-asked whether it addresses the issue and whether it removes anything. The verdict and findings
-go into the pull request body ahead of the test output, so a human sees them first. It never
-blocks: a change that passed its tests still ships as a draft, with the concerns attached.
-
-**Existing files are edited, not rewritten.** The coder returns a whole file only when
-creating one. To change a file that already exists it returns an anchored edit — the exact
-fragment to find and what to replace it with. Asking a small model to reproduce a 9 KB source
-file verbatim in order to alter two lines reliably drops imports, reflows code, or truncates
-it, and the result is deleted work that looks like a plausible diff. An anchor that does not
-match exactly once is rejected and the request is retried, so a stale or invented anchor can
-never apply in the wrong place.
-
-**Retries change the model, not just the attempt.** Free models disagree about what "return
-JSON" means: one answers in prose, one in tool-call syntax, one leaves `content` null and puts
-its answer under `reasoning`. Repeating a request to the same model repeats its convention, so
-each retry moves to the next zero-cost model in the list. Replies are validated for shape
-inside that loop, because a reply that parses but carries the wrong keys is no more useful than
-one that does not parse.
-
-**Failures are recorded, not raised.** Any exception is caught and persisted as a `failed`
-state with its reason, so a run that dies still leaves a readable history. Model calls carry a
-wall-clock deadline as well as a socket timeout, because the free router can trickle bytes
-indefinitely without ever tripping a socket read timeout.
-
-## Scope and trade-offs
-
-These are deliberate, not oversights:
-
-- **The review is written by the author.** The model that wrote the change also reviews it, so
-  it shares the blind spots that produced the change. It is a prompt to look, not assurance,
-  and it never blocks the pull request.
-- **Without Docker there is no isolation.** The fallback path runs host tooling as the current
-  user with the full environment, and installs nothing, so verification is usually skipped.
-  Install Docker to get both isolation and real test results.
-- **The sandbox has network access**, which dependency installation requires. A hostile
-  package cannot reach the host, but it can reach the internet.
-- **Context is size-limited.** The coder receives up to 40 KB of existing source, ordered by
-  relevance to the issue. A repository larger than that will have its least relevant files
-  dropped, so an issue that describes the change vaguely gets a worse selection.
-
-## Roadmap
-
-1. Review by a second, different model, so the reviewer does not share the author's blind spots.
-2. An offline sandbox mode that pre-fetches dependencies, so the suite runs with no network.
-3. A web view over the persisted run timeline.
-
-## Development
-
-```bash
-pip install -e ".[dev]"
-pytest
-```
+Docker is needed for sandboxed tests. Set `DEVPILOT_MODELS` to use specific models instead of
+the free defaults.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT
