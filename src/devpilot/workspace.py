@@ -81,19 +81,22 @@ def relevance(name: str, text: str, terms: set[str], issue_text: str) -> int:
     """Score a file against the issue. Higher sorts earlier and so survives the budget.
 
     An issue naming a path is an explicit instruction and outranks everything. Otherwise a
-    term appearing in the path matters far more than the same term in the body, because a
-    file called themes/nord.tcss is about themes while a file merely mentioning the word
-    usually is not.
+    term in the path matters far more than the same term in the body, because a file called
+    themes/nord.tcss is about themes while a file merely mentioning the word usually is not.
+
+    Body matches count occurrences rather than mere presence: the module that registers every
+    theme names them a dozen times, while a README mentions them once, and treating those as
+    equal drops the file the change actually has to edit. The per-term cap stops one repeated
+    word from crowding out a file that matches several.
     """
     if name in issue_text or Path(name).name in issue_text:
         return 1_000
-    lowered = name.lower()
-    score = 10 * sum(1 for term in terms if term in lowered)
-    body = text.lower()
-    return score + sum(1 for term in terms if term in body)
+    lowered, body = name.lower(), text.lower()
+    path_score = 10 * sum(1 for term in terms if term in lowered)
+    return path_score + sum(min(body.count(term), 8) for term in terms)
 
 
-def source_context(workspace: Path, issue_text: str, budget: int = 40_000, per_file: int = 12_000) -> str:
+def source_context(workspace: Path, issue_text: str, budget: int = 16_000, per_file: int = 12_000) -> str:
     """Return the current contents of files the coder may be asked to rewrite.
 
     The coder returns complete file replacements, so without the existing text it silently
@@ -118,28 +121,180 @@ def source_context(workspace: Path, issue_text: str, budget: int = 40_000, per_f
         candidates.append((-relevance(name, text, terms, issue_text), name, text))
     sections, used = [], 0
     for _, name, text in sorted(candidates):
-        if used + len(text) > budget:
+        # Headers count towards the budget, so the result never exceeds it and a caller that
+        # caps the prompt can never slice a file in half.
+        section = f"--- {name} ---\n{text}"
+        if used + len(section) + 2 > budget:
             continue
-        sections.append(f"--- {name} ---\n{text}")
-        used += len(text)
+        sections.append(section)
+        used += len(section) + 2
     return "\n\n".join(sections) if sections else "(no readable source files)"
+
+
+def safe_target(workspace: Path, path_value: object) -> Path:
+    """Resolve a generated path, refusing anything that escapes the clone or touches .git."""
+    if not isinstance(path_value, str) or not path_value:
+        raise WorkspaceError("Generated changes must carry a relative path.")
+    root = workspace.resolve()
+    target = (workspace / path_value).resolve()
+    if root not in target.parents or ".git" in target.parts:
+        raise WorkspaceError(f"Unsafe generated path rejected: {path_value}")
+    return target
+
+
+# Above this size an existing file may only be changed by an anchored edit. Small files can be
+# rewritten safely; reproducing a large one verbatim is where small models corrupt code.
+REWRITE_LIMIT = 3_000
+
+
+def loose_span(original: str, find: str) -> tuple[int, int] | None:
+    """Locate an anchor by whole lines, ignoring whitespace at the ends of each line.
+
+    Models copying an anchor routinely get indentation or trailing spaces slightly wrong, and
+    an exact-match-only rule turns that into a rejected reply. Worse, it rewards a reply that
+    simply leaves the file out. Still only one matching block is accepted, so a loose anchor
+    can never apply in the wrong place.
+    """
+    want = [line.strip() for line in find.strip("\n").splitlines()]
+    if not any(want):
+        return None
+    lines = original.splitlines(keepends=True)
+    bare = [line.strip() for line in lines]
+    size = len(want)
+    hits = [index for index in range(len(lines) - size + 1) if bare[index:index + size] == want]
+    if len(hits) != 1:
+        return None
+    start = sum(map(len, lines[:hits[0]]))
+    return start, start + sum(map(len, lines[hits[0]:hits[0] + size]))
+
+
+def leading(text: str) -> str:
+    """Return the indentation of the first non-blank line."""
+    for line in text.splitlines():
+        if line.strip():
+            return line[: len(line) - len(line.lstrip())]
+    return ""
+
+
+def shift(text: str, columns: int) -> str:
+    """Indent every non-blank line by `columns`, or dedent by as much when negative."""
+    if columns == 0:
+        return text
+    shifted = []
+    for line in text.splitlines(keepends=True):
+        if line.strip() and columns > 0:
+            line = " " * columns + line
+        elif line.strip():
+            line = line[min(-columns, len(line) - len(line.lstrip(" "))):]
+        shifted.append(line)
+    return "".join(shifted)
+
+
+def reindent(replace: str, find: str, block: str) -> str:
+    """Bring the replacement to the depth of the block it replaces — but only when it carries
+    the same indentation error as the anchor.
+
+    A model that mis-indents its anchor often indents its replacement correctly. Shifting
+    unconditionally then pushes correct text too far, re-indenting every line of the block:
+    a working change with a diff full of noise, which is exactly what happened on a real run.
+    So the replacement moves only if it sits at the anchor's wrong depth rather than the
+    file's; if it already matches the file, or matches neither, it is left as written.
+    """
+    want, got = leading(block), leading(replace)
+    if got != want and got == leading(find):
+        replace = shift(replace, len(want) - len(got))
+    if block.endswith("\n") and not replace.endswith("\n"):
+        replace += "\n"
+    return replace
+
+
+def resolve(workspace: Path, change: dict) -> tuple[str, str]:
+    """Return the path and final text for one change, without writing anything.
+
+    A change is either a whole file ("content") or an edit ("find"/"replace"). The edit form
+    exists because reproducing a large file verbatim to alter two lines is the single least
+    reliable thing a small model does: it drops imports, reflows code, and silently truncates.
+    An edit asks it only for the fragment it is changing, so the rest of the file cannot be
+    damaged. The anchor must identify exactly one place, so a stale or invented anchor is a
+    rejected reply rather than an edit applied in the wrong place.
+
+    Error messages are phrased to complete "the reply was rejected because ...", since they are
+    fed back to the model on its next attempt.
+    """
+    target = safe_target(workspace, change.get("path"))
+    name = str(change["path"])
+    content, find = change.get("content"), change.get("find")
+    if isinstance(find, str):
+        if not target.is_file():
+            raise WorkspaceError(f"{name} does not exist, so it cannot be edited; create it with content instead")
+        replace = change.get("replace")
+        if not isinstance(replace, str):
+            raise WorkspaceError(f"the edit to {name} has no replace text")
+        original = target.read_text(encoding="utf-8")
+        occurrences = original.count(find)
+        if occurrences > 1:
+            raise WorkspaceError(f"the anchor for {name} matches {occurrences} times; it must match exactly once")
+        if occurrences == 1:
+            start = original.index(find)
+            line_start = original.rfind("\n", 0, start) + 1
+            if "\n" in find and original[line_start:start] and not original[line_start:start].strip():
+                # The anchor matched partway into a line's indentation: the model indented it
+                # shallower than the file does. A plain replace would put the first line right
+                # by accident and every added line short of it, so widen to whole lines and
+                # shift the replacement to the file's depth.
+                end = start + len(find)
+                return name, original[:line_start] + reindent(replace, find, original[line_start:end]) + original[end:]
+            return name, original.replace(find, replace)
+        span = loose_span(original, find)
+        if span is None:
+            raise WorkspaceError(
+                f"the find text for {name} does not appear in that file; copy it exactly from the contents shown"
+            )
+        start, end = span
+        return name, original[:start] + reindent(replace, find, original[start:end]) + original[end:]
+    if not isinstance(content, str):
+        raise WorkspaceError(f"the change to {name} has neither content nor an edit")
+    if len(content.encode()) > 100_000:
+        raise WorkspaceError(f"the content for {name} exceeds 100 KB")
+    if target.is_file() and target.stat().st_size > REWRITE_LIMIT:
+        raise WorkspaceError(
+            f"{name} already exists and is too large to rewrite whole; change it with a find/replace edit"
+        )
+    # Models routinely drop the final newline, which every diff then flags on the new file.
+    if content and not content.endswith("\n"):
+        content += "\n"
+    return name, content
+
+
+def problem(workspace: Path, changes: object) -> str | None:
+    """Return why a set of changes cannot be applied, or None if every one resolves cleanly."""
+    if not isinstance(changes, list) or not 1 <= len(changes) <= 8:
+        return "it must contain between 1 and 8 changes"
+    for change in changes:
+        try:
+            resolve(workspace, change if isinstance(change, dict) else {})
+        except (WorkspaceError, OSError, UnicodeDecodeError) as error:
+            return str(error)
+    return None
+
+
+def applicable(workspace: Path, changes: object) -> bool:
+    """Report whether every change could be applied, so a bad reply is retried, not applied."""
+    return problem(workspace, changes) is None
 
 
 def apply_changes(workspace: Path, changes: list[dict]) -> list[str]:
     if not 1 <= len(changes) <= 8:
         raise WorkspaceError("DevPilot accepts between 1 and 8 generated file changes per run.")
+    # Resolved in full before anything is written, so a bad entry cannot leave the clone
+    # half-modified with earlier files already overwritten.
+    resolved = [resolve(workspace, change) for change in changes]
     changed: list[str] = []
-    root = workspace.resolve()
-    for change in changes:
-        path_value, content = change.get("path"), change.get("content")
-        if not isinstance(path_value, str) or not isinstance(content, str) or len(content.encode()) > 100_000:
-            raise WorkspaceError("Generated changes must have a relative path and text under 100 KB.")
-        target = (workspace / path_value).resolve()
-        if root not in target.parents or ".git" in target.parts:
-            raise WorkspaceError(f"Unsafe generated path rejected: {path_value}")
+    for name, text in resolved:
+        target = safe_target(workspace, name)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        changed.append(path_value)
+        target.write_text(text, encoding="utf-8")
+        changed.append(name)
     return changed
 
 

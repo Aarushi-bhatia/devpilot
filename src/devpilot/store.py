@@ -45,7 +45,10 @@ class RunStore:
     @staticmethod
     def _deserialize(payload: str) -> Run:
         raw = json.loads(payload)
-        events = [Event(state=RunState(item["state"]), message=item["message"], at=item["at"]) for item in raw["events"]]
+        events = [
+            Event(state=RunState(item["state"]), message=item["message"], at=item["at"], detail=item.get("detail", False))
+            for item in raw["events"]
+        ]
         return Run(
             id=raw["id"], repository_url=raw["repository_url"], issue_number=raw["issue_number"],
             state=RunState(raw["state"]), plan=raw["plan"], review=raw.get("review", {}),

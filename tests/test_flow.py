@@ -62,7 +62,7 @@ def build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **behaviour) -> tuple
     agent.on_event = events.append
     agent.github = FakeGitHub()
     agent.github_token, agent.openrouter_key, agent.workspaces = "t", "k", workspace_root
-    monkeypatch.setattr(agent, "_plan", lambda issue, snapshot, rejected=None: [f"step {len(rejected or [])}", "step b"])
+    monkeypatch.setattr(agent, "_plan", lambda issue, snapshot, sources, rejected=None: [f"step {len(rejected or [])}", "step b"])
     monkeypatch.setattr(agent, "_changes", lambda *a, **k: [{"path": "LICENSE", "content": "MIT"}])
     monkeypatch.setattr(agent, "_review", behaviour.get(
         "review", lambda issue, patch, verification: {"verdict": "approve", "summary": "Fine.", "findings": []}))
@@ -206,3 +206,191 @@ def test_a_trickling_response_is_abandoned_at_the_deadline(monkeypatch: pytest.M
     with pytest.raises(OpenRouterError, match="did not respond within"):
         post(request_module.Request("https://example.invalid"), deadline=1)
     assert clock.monotonic() - started < 5, "the caller must not wait for the abandoned request"
+
+
+def test_a_wrongly_shaped_reply_is_retried_rather_than_ending_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reply that parses but carries the wrong keys used to kill a run on the first draw."""
+    from devpilot import openrouter
+    from devpilot.orchestrator import valid_changes
+
+    replies = iter([
+        '{"files": []}',                                        # wrong key
+        '{"changes": "a string, not a list"}',                  # wrong type
+        '{"changes":[{"path":"a.py","content":"x"}]}',          # correct
+    ])
+    monkeypatch.setattr(openrouter, "complete", lambda *a, **k: next(replies))
+    result = openrouter.json_call("k", "s", "p", shape=valid_changes)
+    assert result["changes"] == [{"path": "a.py", "content": "x"}]
+
+
+def test_shape_failures_eventually_give_up_with_a_useful_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    from devpilot import openrouter
+    from devpilot.orchestrator import valid_changes
+
+    monkeypatch.setattr(openrouter, "complete", lambda *a, **k: '{"summary": "done"}')
+    with pytest.raises(openrouter.OpenRouterError, match="did not match the requested shape"):
+        openrouter.json_call("k", "s", "p", shape=valid_changes)
+
+
+def test_a_null_content_reply_is_retried_rather_than_crashing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reasoning models leave content null; that used to surface as an AttributeError."""
+    from devpilot import openrouter
+
+    replies = iter([
+        {"choices": [{"message": {"content": None}}]},                       # null content
+        {"choices": [{"message": {"content": "", "reasoning": "  "}}]},      # empty both
+        {"choices": [{"message": {"content": '{"plan":["a","b"]}'}}]},       # usable
+    ])
+    monkeypatch.setattr(openrouter, "post", lambda request, deadline, **_: next(replies))
+    assert openrouter.json_call("k", "s", "p")["plan"] == ["a", "b"]
+
+
+def test_output_is_read_from_reasoning_when_content_is_null(monkeypatch: pytest.MonkeyPatch) -> None:
+    from devpilot import openrouter
+
+    monkeypatch.setattr(
+        openrouter, "post",
+        lambda request, deadline, **_: {"choices": [{"message": {"content": None, "reasoning": '{"plan":["a","b"]}'}}]},
+    )
+    assert openrouter.json_call("k", "s", "p")["plan"] == ["a", "b"]
+
+
+def test_a_rate_limit_fails_immediately_instead_of_burning_more_quota(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every model shares one account quota, so rotating to the next cannot help."""
+    import urllib.error
+
+    from devpilot import openrouter
+
+    calls = []
+
+    def refuse(request, timeout):
+        calls.append(1)
+        raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {}, None)
+
+    monkeypatch.setattr(openrouter.urllib.request, "urlopen", refuse)
+    with pytest.raises(openrouter.RateLimited, match="daily quota"):
+        openrouter.json_call("k", "s", "p")
+    assert len(calls) == 1, "a rate limit must not be retried across models"
+
+
+def test_progress_names_each_model_and_how_it_answered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A slow run must read as work in progress: which model, which attempt, what happened."""
+    from devpilot import openrouter
+
+    replies = iter([openrouter.OpenRouterError("OpenRouter did not respond within 120s"), '{"plan":["a","b"]}'])
+
+    def fake_complete(*args, **kwargs):
+        reply = next(replies)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(openrouter, "complete", fake_complete)
+    lines: list[str] = []
+    openrouter.json_call("k", "s", "p", progress=lines.append)
+    assert lines[0].startswith("Asking nemotron") and "attempt 1/6" in lines[0]
+    assert "no response" in lines[1] and "trying the next model" in lines[1]
+    assert "attempt 2/6" in lines[2]
+    assert lines[3].startswith("↳ answered in")
+
+
+def test_the_live_wait_is_always_cleared_after_each_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A spinner left running would overwrite the approval prompt and the summary."""
+    from devpilot import openrouter
+
+    replies = iter([openrouter.OpenRouterError("boom"), '{"plan":["a","b"]}'])
+
+    def fake_complete(*args, tick=None, **kwargs):
+        tick(5.0)
+        reply = next(replies)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(openrouter, "complete", fake_complete)
+    ticks: list = []
+    openrouter.json_call("k", "s", "p", tick=ticks.append)
+    assert ticks == [5.0, None, 5.0, None]
+
+
+def test_progress_lines_are_persisted_as_details(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    agent, _, events = build(tmp_path, monkeypatch)
+    agent._active = Run(repository_url="https://github.com/o/r", issue_number=1)
+    agent.store.save(agent._active)
+    agent._progress("Asking nemotron (attempt 1/6)")
+    reloaded = agent.store.get(agent._active.id)
+    assert reloaded.events[-1].detail is True
+    assert events[-1].message == "Asking nemotron (attempt 1/6)"
+
+
+def test_a_reply_that_skips_a_planned_file_is_rejected() -> None:
+    """The exact failure observed: theme file created, registration in screens.py skipped."""
+    from devpilot.orchestrator import uncovered
+
+    plan = [
+        "Create gravitype/tui/styles/themes/solarized_dark.tcss following gravitype/tui/styles/themes/nord.tcss",
+        "Edit `gravitype/tui/widgets/screens.py` to add solarized_dark to the Select options.",
+        "Run the application and confirm the theme appears in gravitype/tui/app.py",
+    ]
+    created_only = {"gravitype/tui/styles/themes/solarized_dark.tcss"}
+    assert "step 2" in uncovered(plan, created_only)
+    assert uncovered(plan, created_only | {"gravitype/tui/widgets/screens.py"}) is None
+
+
+def test_the_next_attempt_is_told_why_the_last_one_was_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    from devpilot import openrouter
+
+    prompts: list[str] = []
+    replies = iter(['{"n": 1}', '{"n": 2}'])
+
+    def fake_complete(api_key, system, prompt, **kwargs):
+        prompts.append(prompt)
+        return next(replies)
+
+    def shape(response):
+        if response["n"] == 1:
+            raise ValueError("step 2 of the approved plan changes screens.py, but the reply leaves it untouched")
+        return True
+
+    monkeypatch.setattr(openrouter, "complete", fake_complete)
+    openrouter.json_call("k", "s", "base prompt", shape=shape)
+    assert "rejected because" not in prompts[0]
+    assert "rejected because step 2 of the approved plan changes screens.py" in prompts[1]
+
+
+def test_review_concerns_trigger_exactly_one_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reviews = iter([
+        {"verdict": "concerns", "summary": "Registration missing.", "findings": ["screens.py not updated"]},
+        {"verdict": "approve", "summary": "Complete now.", "findings": []},
+    ])
+    agent, github, _ = build(tmp_path, monkeypatch, review=lambda issue, patch, verification: next(reviews))
+    calls: list = []
+    monkeypatch.setattr(agent, "_changes", lambda *a, **k: calls.append(a) or [{"path": "LICENSE", "content": "MIT"}])
+    run = agent.run("https://github.com/o/r", 1, lambda _: True)
+    assert run.state is RunState.COMPLETED
+    assert len(calls) == 2, "one implementation and one revision"
+    assert "screens.py not updated" in calls[1][5], "the revision is told what the review found"
+    assert run.review["verdict"] == "approve"
+    assert "Complete now." in github.created[0][1]
+
+
+def test_a_reviewer_that_is_never_satisfied_does_not_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stubborn = lambda issue, patch, verification: {"verdict": "concerns", "summary": "No.", "findings": ["no"]}
+    agent, github, _ = build(tmp_path, monkeypatch, review=stubborn)
+    calls: list = []
+    monkeypatch.setattr(agent, "_changes", lambda *a, **k: calls.append(a) or [{"path": "LICENSE", "content": "MIT"}])
+    run = agent.run("https://github.com/o/r", 1, lambda _: True)
+    assert run.state is RunState.COMPLETED and len(calls) == 2
+    assert "Concerns raised" in github.created[0][1]
+
+
+def test_the_verification_summary_keeps_the_test_tally() -> None:
+    from devpilot.orchestrator import outcome
+
+    passed = "Sandboxed tests passed in python:3.12-slim:\n........\n381 passed in 12.30s"
+    assert outcome(passed) == "Sandboxed tests passed in python:3.12-slim — 381 passed in 12.30s"
+    assert outcome("Verification skipped: Docker is not running.") == "Verification skipped: Docker is not running."

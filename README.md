@@ -9,8 +9,8 @@ Issue → Understand → Explore → Plan → Approval → Implement → Verify 
 ```
 
 Every state transition is persisted to SQLite as it happens, so any past run can be replayed
-with `devpilot show`. The model is pinned to OpenRouter's zero-cost `openrouter/free` router,
-so a run can fail for lack of a free model but will never silently fall back to a paid one.
+with `devpilot show`. Every model DevPilot can select is zero-cost, so a run can fail for lack
+of a free model but will never silently fall back to a paid one.
 
 ## Requirements
 
@@ -72,6 +72,21 @@ which installs nothing and therefore usually reports verification as skipped.
 asked whether it addresses the issue and whether it removes anything. The verdict and findings
 go into the pull request body ahead of the test output, so a human sees them first. It never
 blocks: a change that passed its tests still ships as a draft, with the concerns attached.
+
+**Existing files are edited, not rewritten.** The coder returns a whole file only when
+creating one. To change a file that already exists it returns an anchored edit — the exact
+fragment to find and what to replace it with. Asking a small model to reproduce a 9 KB source
+file verbatim in order to alter two lines reliably drops imports, reflows code, or truncates
+it, and the result is deleted work that looks like a plausible diff. An anchor that does not
+match exactly once is rejected and the request is retried, so a stale or invented anchor can
+never apply in the wrong place.
+
+**Retries change the model, not just the attempt.** Free models disagree about what "return
+JSON" means: one answers in prose, one in tool-call syntax, one leaves `content` null and puts
+its answer under `reasoning`. Repeating a request to the same model repeats its convention, so
+each retry moves to the next zero-cost model in the list. Replies are validated for shape
+inside that loop, because a reply that parses but carries the wrong keys is no more useful than
+one that does not parse.
 
 **Failures are recorded, not raised.** Any exception is caught and persisted as a `failed`
 state with its reason, so a run that dies still leaves a readable history. Model calls carry a

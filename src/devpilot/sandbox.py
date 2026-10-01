@@ -15,11 +15,30 @@ from pathlib import Path
 
 # Each ecosystem installs and tests in one shell invocation. Install failures are not fatal:
 # a suite that runs without its optional dependencies still tells us more than no suite.
+# Exit code reserved by the scripts below to mean "the test runner never installed", which is
+# an environment gap rather than a failing suite and must not provoke a debugging pass.
+NO_RUNNER = 123
+
+# Test dependencies are declared in at least four incompatible ways, so each is tried in turn.
+# PEP 735 dependency-groups come first because pip only learned them in 25.1 and a project
+# using them looks, to an older pip, exactly like a project with no test dependencies at all.
+PYTHON_SCRIPT = (
+    "pip install -qU pip 2>/dev/null || true; "
+    "pip install -q -e . 2>/dev/null || true; "
+    "pip install -q --group dev 2>/dev/null "
+    "|| pip install -q -e '.[dev]' 2>/dev/null "
+    "|| pip install -q -e '.[test]' 2>/dev/null "
+    "|| pip install -q -r requirements-dev.txt 2>/dev/null "
+    "|| pip install -q -r requirements.txt 2>/dev/null || true; "
+    f"python -m pytest --version >/dev/null 2>&1 || exit {NO_RUNNER}; "
+    # No -q here: projects commonly set it in addopts already, and a second one suppresses the
+    # "N passed" summary that the run log and the pull request report.
+    "python -m pytest"
+)
+
 RECIPES: list[tuple[str, str, str]] = [
-    ("pyproject.toml", "python:3.12-slim",
-     "pip install --quiet --disable-pip-version-check -e '.[dev]' || pip install --quiet -e . || true; python -m pytest -q"),
-    ("pytest.ini", "python:3.12-slim",
-     "pip install --quiet --disable-pip-version-check -r requirements.txt || true; python -m pytest -q"),
+    ("pyproject.toml", "python:3.12-slim", PYTHON_SCRIPT),
+    ("pytest.ini", "python:3.12-slim", PYTHON_SCRIPT),
     ("package.json", "node:22-slim", "npm ci --silent || npm install --silent; npm test"),
     ("go.mod", "golang:1.23-alpine", "go test ./..."),
     ("Cargo.toml", "rust:1-slim", "cargo test"),
@@ -124,6 +143,8 @@ def verify(workspace: Path, uid: int, gid: int, timeout: int = 600) -> str:
         # Docker's own exit code for "the container never started": bad image, pull failure,
         # daemon gone. The generated change was never executed.
         raise SandboxUnavailable(f"the container never started:\n{output[-2000:]}")
+    if result.returncode == NO_RUNNER:
+        raise SandboxUnavailable("the repository's test dependencies could not be installed")
     if result.returncode:
         raise SandboxError(f"Sandboxed tests failed ({result.returncode}):\n{output[-6000:]}")
     return f"Sandboxed tests passed in {image}:\n{output[-4000:]}"

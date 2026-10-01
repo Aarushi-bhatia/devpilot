@@ -24,7 +24,34 @@ def store() -> RunStore:
 
 
 def display_event(event: Event) -> None:
-    console.print(f"[bold cyan]{event.state.value:>20}[/]  {event.message}")
+    if event.detail:
+        console.print(f"{'':>20}  [dim]{event.message}[/]")
+    else:
+        console.print(f"[bold cyan]{event.state.value:>20}[/]  {event.message}")
+
+
+class Waiting:
+    """A live spinner with elapsed seconds while a model call is in flight.
+
+    Free models routinely take a minute or more, and a screen that prints nothing for that
+    long is indistinguishable from a hang. Rich renders events printed meanwhile above it.
+    """
+
+    def __init__(self) -> None:
+        self.status = None
+
+    def __call__(self, elapsed: float | None) -> None:
+        if elapsed is None:
+            if self.status is not None:
+                self.status.stop()
+                self.status = None
+            return
+        text = f"[dim]waiting for the model… {int(elapsed)}s[/]"
+        if self.status is None:
+            self.status = console.status(text, spinner="dots")
+            self.status.start()
+        else:
+            self.status.update(text)
 
 
 @app.command()
@@ -58,9 +85,14 @@ def run(
         return False
 
     secrets = load_secrets()
-    workflow_run = LiveOrchestrator(
-        store(), display_event, secrets.get("GITHUB_TOKEN", ""), secrets.get("OPENROUTER_API_KEY", ""), workspaces_dir(),
-    ).run(repository_url, issue, approve)
+    waiting = Waiting()
+    try:
+        workflow_run = LiveOrchestrator(
+            store(), display_event, secrets.get("GITHUB_TOKEN", ""), secrets.get("OPENROUTER_API_KEY", ""),
+            workspaces_dir(), on_wait=waiting,
+        ).run(repository_url, issue, approve)
+    finally:
+        waiting(None)  # never leave a spinner running over the summary or a traceback
     color = "green" if workflow_run.state.value == "completed" else "yellow"
     console.print(Panel(f"Run ID: [bold]{workflow_run.id}[/]\nFinal state: [bold]{workflow_run.state.value}[/]", title="DevPilot", border_style=color))
 
@@ -95,7 +127,10 @@ def show(run_id: str) -> None:
         console.print(Panel(f"{workflow_run.review.get('summary', '')}\n{findings}".strip(),
                             title=f"Review — {workflow_run.review.get('verdict')}", border_style=colour))
     for event in workflow_run.events:
-        console.print(f"[cyan]{event.at}[/] [bold]{event.state.value}[/] — {event.message}")
+        if event.detail:
+            console.print(f"{'':>32} [dim]{event.message}[/]")
+        else:
+            console.print(f"[cyan]{event.at}[/] [bold]{event.state.value}[/] — {event.message}")
 
 
 @app.command()
